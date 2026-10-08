@@ -1,0 +1,11 @@
+{
+  "timeout_seconds": 30,
+  "sample_temperature": 0.9,
+  "synthetic_demo": true,
+  "roles": {
+    "gpt6": {"command": ["python3", "mock_model.py", "gpt6"]},
+    "claude": {"command": ["python3", "mock_model.py", "claude"]},
+    "target": {"command": ["python3", "mock_model.py", "target"]},
+    "verifier": {"command": ["python3", "mock_model.py", "verifier"]}
+  }
+}
