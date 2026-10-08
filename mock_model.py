@@ -105,7 +105,18 @@ def main():
     elif op == "verify":
         # Only the bundled fixture is covered; replace this command for real tasks.
         result = {"correct": item.get("id") == "china-capital"
-                  and "北京" in request["text"] and "不是北京" not in request["text"]}
+                  and "北京" in request["text"] and "不是北京" not in request["text"],
+                  "evidence": "fixture answer key: china-capital=北京"}
+    elif op == "validate_reference":
+        result = {"trusted": item.get("id") == "china-capital"
+                  and item.get("reference") == "北京"
+                  and item.get("reference_source") == "demo-fixture",
+                  "evidence": "fixture answer key: china-capital=北京"}
+    elif op == "quality":
+        acceptable = score(request["text"], item) >= 5
+        result = {"acceptable": acceptable,
+                  "reason": "mock rubric: sufficiently answers prompt" if acceptable
+                  else "mock rubric: incomplete answer"}
     else:
         raise ValueError(f"unknown operation: {op}")
     json.dump(result, sys.stdout, ensure_ascii=False)

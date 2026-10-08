@@ -1,4 +1,6 @@
 __pycache__/
 .env*
 data.jsonl
+*.checkpoint.sqlite3*
+review.jsonl*
 *.log

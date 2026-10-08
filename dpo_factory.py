@@ -4,14 +4,22 @@
 import argparse
 import hashlib
 import json
+import os
 import random
+import sqlite3
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def pair_key(prompt, chosen, rejected):
+    return hashlib.sha256(json.dumps([prompt, chosen, rejected],
+                                    ensure_ascii=False).encode()).hexdigest()
 
 
 def call(command, request, timeout):
@@ -35,6 +43,7 @@ def call(command, request, timeout):
 class Pipeline:
     def __init__(self, config, seed):
         self.config = config
+        self.seed = seed
         self.rng = random.Random(seed)
         self.stats = Counter()
         self.seen = set()
@@ -61,20 +70,28 @@ class Pipeline:
         return text.strip()
 
     def valid_task(self, task):
-        if task.get("kind") not in ("open", "objective") or not task.get("prompt"):
+        if task.get("kind") not in ("open", "objective") or not isinstance(task.get("prompt"), str) or not task["prompt"].strip():
             return False
         if task["kind"] == "objective":
-            return bool(task.get("reference") and task.get("reference_source")
-                        and task["reference_source"] != "model")
+            if not all(isinstance(task.get(field), str) and task[field].strip()
+                       for field in ("reference", "reference_source")):
+                return False
+            result = self.ask("verifier", "validate_reference", task=task)
+            if (type(result.get("trusted")) is not bool or
+                    not isinstance(result.get("evidence"), str) or not result["evidence"].strip()):
+                raise ValueError("validate_reference must return trusted and evidence")
+            task["reference_evidence"] = result["evidence"]
+            return result["trusted"]
         return True
 
-    def verify(self, task, text):
-        if task["kind"] == "open":
-            return True
-        result = self.ask("verifier", "verify", task=task, text=text)
-        if type(result.get("correct")) is not bool:
-            raise ValueError("verifier must return a boolean correct field")
-        return result["correct"]
+    def verdict(self, task, text):
+        op, field, reason = (("verify", "correct", "evidence") if task["kind"] == "objective"
+                             else ("quality", "acceptable", "reason"))
+        result = self.ask("verifier", op, task=task, text=text)
+        if (type(result.get(field)) is not bool or
+                not isinstance(result.get(reason), str) or not result[reason].strip()):
+            raise ValueError(f"{op} must return boolean {field} and nonempty {reason}")
+        return {"passed": result[field], "reason": result[reason]}
 
     def rank(self, judge, task, answers):
         ids = list(range(len(answers)))
@@ -93,14 +110,14 @@ class Pipeline:
                               candidates=[{"id": i, "text": t} for i, t in enumerate(order)])
             winner_id = result.get("winner")
             winners.append(order[winner_id] if type(winner_id) is int and winner_id in (0, 1) else None)
-        return winners[0] if winners[0] == winners[1] and winners[0] in (a, b) else None
+        winner = winners[0] if winners[0] == winners[1] and winners[0] in (a, b) else None
+        return winner, winners
 
     def pair(self, task, chosen, rejected, route, judge, corrected=False, trace=None):
         if chosen.strip() == rejected.strip():
             self.stats["skip_identical"] += 1
             return None
-        key = hashlib.sha256(json.dumps([task["prompt"], chosen, rejected],
-                                        ensure_ascii=False).encode()).hexdigest()
+        key = pair_key(task["prompt"], chosen, rejected)
         if key in self.seen:
             self.stats["skip_duplicate"] += 1
             return None
@@ -111,33 +128,51 @@ class Pipeline:
                          "kind": task["kind"], "corrected": corrected,
                          "synthetic_demo": self.config.get("synthetic_demo", False),
                          "reference_source": task.get("reference_source"),
+                         "reference_evidence": task.get("reference_evidence"),
+                         "run_seed": self.seed,
+                         "models": {role: data.get("model_id", role)
+                                    for role, data in self.config["roles"].items()},
                          "trace": trace or {}}}
 
-    def decide(self, task, preferred, other, route, judge, corrector,
-               confirmed=False, trace=None):
+    def decide(self, task, preferred, other, route, judge, corrector, trace=None):
+        trace = dict(trace or {})
         if task["kind"] == "objective":
-            if not self.verify(task, preferred):
+            preferred_verdict = self.verdict(task, preferred)
+            if not preferred_verdict["passed"]:
                 fix = self.ask(corrector, "correct", task=task, rejected=preferred)["text"]
-                if not self.verify(task, fix):
+                if not isinstance(fix, str) or not fix.strip():
+                    self.stats["skip_failed_correction"] += 1
+                    return None
+                fix_verdict = self.verdict(task, fix)
+                trace["verdicts"] = {"chosen": fix_verdict, "rejected": preferred_verdict}
+                if not fix_verdict["passed"]:
                     self.stats["skip_failed_correction"] += 1
                     return None
                 return self.pair(task, fix, preferred, route, judge,
                                  corrected=True, trace=trace)
-            if self.verify(task, other) and not confirmed:
-                winner = self.compare(judge, task, preferred, other)
+            other_verdict = self.verdict(task, other)
+            if other_verdict["passed"]:
+                winner, votes = self.compare(judge, task, preferred, other)
+                trace["compare_votes"] = votes
                 if winner is None:
                     self.stats["skip_unstable_judge"] += 1
                     return None
-                preferred, other = (preferred, other) if winner == preferred else (other, preferred)
-        elif not confirmed:
-            winner = self.compare(judge, task, preferred, other)
+                if winner == other:
+                    preferred, other = other, preferred
+                    preferred_verdict, other_verdict = other_verdict, preferred_verdict
+            trace["verdicts"] = {"chosen": preferred_verdict, "rejected": other_verdict}
+        else:
+            winner, votes = self.compare(judge, task, preferred, other)
+            trace["compare_votes"] = votes
             if winner is None:
                 self.stats["skip_unstable_judge"] += 1
                 return None
             preferred, other = (preferred, other) if winner == preferred else (other, preferred)
-        if task["kind"] == "objective" and not self.verify(task, preferred):
-            self.stats["skip_invalid_chosen"] += 1
-            return None
+            chosen_verdict = self.verdict(task, preferred)
+            trace["verdicts"] = {"chosen": chosen_verdict}
+            if not chosen_verdict["passed"]:
+                self.stats["skip_low_quality_chosen"] += 1
+                return None
         return self.pair(task, preferred, other, route, judge, trace=trace)
 
     def routes_1_2(self, task):
@@ -156,16 +191,26 @@ class Pipeline:
         if first:
             out.append(first)
         rewrite = self.ask("gpt6", "rewrite", task=task, original=top)["text"]
-        winner = self.compare("claude", task, top, rewrite)
-        if winner is None:
-            self.stats["skip_unstable_judge"] += 1
-        else:
-            second = self.decide(task, winner,
-                                 rewrite if winner == top else top,
-                                 "route2", "claude", "gpt6", confirmed=True,
-                                 trace={"original": top, "rewrite": rewrite})
-            if second:
-                out.append(second)
+        if not isinstance(rewrite, str) or not rewrite.strip() or rewrite.strip() == top:
+            self.stats["skip_no_improvement"] += 1
+            return out
+        rewrite_verdict = self.verdict(task, rewrite)
+        if not rewrite_verdict["passed"]:
+            self.stats["skip_bad_rewrite"] += 1
+            return out
+        original_verdict = self.verdict(task, top)
+        winner, votes = self.compare("claude", task, top, rewrite)
+        factual_override = task["kind"] == "objective" and not original_verdict["passed"]
+        if not factual_override and winner != rewrite:
+            self.stats["skip_no_improvement"] += 1
+            return out
+        trace = {"original": top, "rewrite": rewrite, "compare_votes": votes,
+                 "verdicts": {"chosen": rewrite_verdict, "rejected": original_verdict},
+                 "factual_override": factual_override}
+        second = self.pair(task, rewrite, top, "route2",
+                           "verifier" if factual_override else "claude", trace=trace)
+        if second:
+            out.append(second)
         return out
 
     def route_3(self, asker, answerer, index):
@@ -195,20 +240,68 @@ def main():
     if args.count < 1:
         parser.error("--count must be at least 1")
     config = json.loads(args.config.read_text())
-    pipeline = Pipeline(config, args.seed)
     tasks = [json.loads(line) for line in args.tasks.read_text().splitlines() if line.strip()]
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w") as output:
-        for i in range(args.count):
-            task = tasks[i] if i < len(tasks) else pipeline.task("gpt6", i)
+    stats = run(config, tasks, args.count, args.seed, args.out)
+    print(json.dumps({"out": str(args.out), "stats": stats}, ensure_ascii=False))
+
+
+def run(config, tasks, count, seed, out):
+    """Commit each round to SQLite, then atomically publish the JSONL file."""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    signature = hashlib.sha256(json.dumps(
+        {"config": config, "tasks": tasks, "count": count, "seed": seed,
+         "implementation": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    checkpoint = Path(str(out) + ".checkpoint.sqlite3")
+    with sqlite3.connect(checkpoint) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS run (signature TEXT NOT NULL)")
+        db.execute("CREATE TABLE IF NOT EXISTS rounds (idx INTEGER PRIMARY KEY, pairs TEXT NOT NULL, stats TEXT NOT NULL)")
+        saved = db.execute("SELECT signature FROM run").fetchone()
+        if saved and saved[0] != signature:
+            raise ValueError(f"checkpoint belongs to another run: {checkpoint}")
+        if not saved:
+            db.execute("INSERT INTO run VALUES (?)", (signature,))
+            db.commit()
+        rounds = {i: (json.loads(pairs), json.loads(round_stats)) for i, pairs, round_stats
+                  in db.execute("SELECT idx, pairs, stats FROM rounds")}
+        seen = {pair_key(p["prompt"], p["chosen"], p["rejected"])
+                for pairs, _ in rounds.values() for p in pairs}
+        totals = Counter()
+        for i in range(count):
+            if i in rounds:
+                totals.update(rounds[i][1])
+                continue
+            pipeline = Pipeline(config, seed + i)
+            pipeline.seen = seen
+            task = dict(tasks[i]) if i < len(tasks) else pipeline.task("gpt6", i)
             task.setdefault("id", f"seed-{i}")
-            for pair in pipeline.routes_1_2(task):
-                output.write(json.dumps(pair, ensure_ascii=False) + "\n")
+            pairs = pipeline.routes_1_2(task)
             for asker, answerer in (("gpt6", "claude"), ("claude", "gpt6")):
                 pair = pipeline.route_3(asker, answerer, i)
                 if pair:
+                    pairs.append(pair)
+            db.execute("INSERT INTO rounds VALUES (?, ?, ?)",
+                       (i, json.dumps(pairs, ensure_ascii=False),
+                        json.dumps(pipeline.stats, ensure_ascii=False)))
+            db.commit()
+            totals.update(pipeline.stats)
+            rounds[i] = (pairs, dict(pipeline.stats))
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=out.parent, prefix=out.name + ".",
+                                         delete=False) as output:
+            temp_path = output.name
+            for i in range(count):
+                for pair in rounds[i][0]:
                     output.write(json.dumps(pair, ensure_ascii=False) + "\n")
-    print(json.dumps({"out": str(args.out), "stats": pipeline.stats}, ensure_ascii=False))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, out)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return totals
 
 
 if __name__ == "__main__":
